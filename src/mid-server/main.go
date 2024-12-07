@@ -2,106 +2,107 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
-	"net/http"
-	"sync"
+	"net"
+	"time"
 
 	"github.com/armon/go-socks5"
-	"github.com/gorilla/websocket"
+	"github.com/quic-go/quic-go"
 )
 
-var (
-	radServerConn *websocket.Conn // Global WebSocket connection
-	wsMutex       sync.Mutex      // Mutex to prevent concurrent writes
-)
+var radConnection quic.Connection // Global QUIC connection to Rad-Server
 
 func main() {
-	// Start SOCKS5 Proxy and WebSocket Server
-	go startSocks5Proxy()     // SOCKS5 server
-	go startWebSocketServer() // WebSocket server
+	// Start SOCKS5 proxy
+	go startSocks5Proxy()
 
-	// Keep the main thread alive
-	select {}
+	// Accept Rad-Server connection
+	acceptRadConnection()
+
+	select {} // Keep the main thread alive
 }
 
-// Start the SOCKS5 Proxy Server
+// acceptRadConnection accepts a QUIC connection from Rad-Server
+func acceptRadConnection() {
+	listener, err := quic.ListenAddr("0.0.0.0:8100", generateTLSConfig(), nil)
+	if err != nil {
+		log.Fatalf("Failed to start QUIC listener: %v", err)
+	}
+	log.Println("Listening for Rad-Server connections on 0.0.0.0:8100...")
+
+	// Accept the Rad-Server connection
+	connection, err := listener.Accept(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to accept Rad-Server connection: %v", err)
+	}
+	radConnection = connection
+	log.Println("Rad-Server connected.")
+}
+
+// startSocks5Proxy starts the SOCKS5 proxy server
 func startSocks5Proxy() {
 	conf := &socks5.Config{
-		Rules: &loggingRule{}, // Custom rule for logging
+		Dial: customDialToRadServer, // Custom dialer to forward traffic via Rad-Server
 	}
 	server, err := socks5.New(conf)
 	if err != nil {
 		log.Fatalf("Failed to create SOCKS5 server: %v", err)
 	}
 
-	// Listen for SOCKS5 connections
 	address := "0.0.0.0:1080"
-	log.Printf("SOCKS Proxy Server listening on %s\n", address)
+	log.Printf("SOCKS5 Proxy Server listening on %s\n", address)
 	if err := server.ListenAndServe("tcp", address); err != nil {
 		log.Fatalf("Failed to start SOCKS5 server: %v", err)
 	}
 }
 
-// Custom logging rule for SOCKS5 requests
-type loggingRule struct{}
-
-func (r *loggingRule) Allow(ctx context.Context, req *socks5.Request) (context.Context, bool) {
-	log.Printf("New SOCKS request:\n  Command: %v\n  Destination: %s:%d\n",
-		req.Command, req.DestAddr.IP, req.DestAddr.Port)
-
-	// Forward data to the Rad-Server via WebSocket if connected
-	if radServerConn != nil {
-		message := fmt.Sprintf("SOCKS request to %s:%d", req.DestAddr.IP, req.DestAddr.Port)
-
-		// Lock before writing to WebSocket
-		wsMutex.Lock()
-		defer wsMutex.Unlock()
-
-		err := radServerConn.WriteMessage(websocket.TextMessage, []byte(message))
-		if err != nil {
-			log.Printf("Failed to send message to Rad-Server: %v", err)
-		} else {
-			log.Println("Forwarded request to Rad-Server via WebSocket")
-		}
-	} else {
-		log.Println("No Rad-Server connected via WebSocket.")
+// customDialToRadServer forwards SOCKS5 traffic to Rad-Server using QUIC streams
+func customDialToRadServer(ctx context.Context, network, addr string) (net.Conn, error) {
+	if radConnection == nil {
+		return nil, fmt.Errorf("No connection to Rad-Server established")
 	}
 
-	return ctx, true
+	// Open a new QUIC stream to Rad-Server
+	stream, err := radConnection.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to open QUIC stream to Rad-Server: %v", err)
+	}
+
+	// Send the CONNECT request (target address) to Rad-Server
+	_, err = stream.Write([]byte(addr))
+	if err != nil {
+		return nil, fmt.Errorf("Failed to send CONNECT request to Rad-Server: %v", err)
+	}
+
+	log.Printf("Forwarding request to Rad-Server: %s", addr)
+
+	// Return the QUIC stream as a net.Conn for SOCKS5 compatibility
+	return &quicStreamWrapper{stream}, nil
 }
 
-// Start WebSocket Server to Accept Rad-Server Connections
-func startWebSocketServer() {
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true }, // Allow all origins for simplicity
-	}
+// quicStreamWrapper adapts a QUIC stream to net.Conn
+type quicStreamWrapper struct {
+	quic.Stream
+}
 
-	http.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
-		var err error
-		radServerConn, err = upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Printf("Failed to upgrade to WebSocket: %v", err)
-			return
-		}
-		defer radServerConn.Close()
+func (q *quicStreamWrapper) LocalAddr() net.Addr  { return nil }
+func (q *quicStreamWrapper) RemoteAddr() net.Addr { return nil }
+func (q *quicStreamWrapper) SetDeadline(t time.Time) error {
+	return nil
+}
+func (q *quicStreamWrapper) SetReadDeadline(t time.Time) error {
+	return nil
+}
+func (q *quicStreamWrapper) SetWriteDeadline(t time.Time) error {
+	return nil
+}
 
-		log.Println("Rad-Server connected via WebSocket.")
-		for {
-			// Read messages from Rad-Server
-			_, message, err := radServerConn.ReadMessage()
-			if err != nil {
-				log.Printf("WebSocket disconnected: %v", err)
-				radServerConn = nil
-				break
-			}
-			log.Printf("Message from Rad-Server: %s", string(message))
-		}
-	})
-
-	address := "0.0.0.0:8100"
-	log.Printf("WebSocket server listening on %s/connect\n", address)
-	if err := http.ListenAndServe(address, nil); err != nil {
-		log.Fatalf("WebSocket server error: %v", err)
+// generateTLSConfig generates the TLS configuration for QUIC
+func generateTLSConfig() *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: true, // Skip verification for simplicity
+		NextProtos:         []string{"quic-go"},
 	}
 }
