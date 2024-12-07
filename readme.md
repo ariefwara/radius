@@ -20,21 +20,31 @@ This approach enables developers to access private systems as though they were l
 
 ### **Setup**  
 -----
-To set up **Radius**, you need to deploy two components: the **Rad-Server** inside the private or remote environment and the **Mid-Server** on a publicly accessible machine. First, download the precompiled binaries for both components from the project’s GitHub repository.  
 
-Start by running the **Rad-Server** in the private environment where your backend systems, APIs, or services are located. The Rad-Server will establish a secure outgoing connection to the Mid-Server. Run the Rad-Server binary with the following command:  
-```bash  
-./rad-server -mid ws://<mid-server-address>:8080/connect  
-```  
-Here, replace `<mid-server-address>` with the public address of the Mid-Server.
+To set up **Radius**, you need to run two components: the **Mid-Server** and the **Rad-Server**. The Mid-Server acts as a public bridge, while the Rad-Server connects securely to it from a private environment. Both binaries can be downloaded from the project’s GitHub repository.  
 
-Next, run the **Mid-Server** binary on your laptop or any server that can be accessed publicly. The Mid-Server listens for incoming SOCKS5 connections on port `1080` and accepts WebSocket connections from the Rad-Server on port `8080`. Use the following command:  
+**Step 1: Run the Mid-Server**  
+Start by running the **Mid-Server** on your laptop or any machine that can be accessed publicly. The Mid-Server listens for incoming **SOCKS5 proxy connections** on port `1080` and accepts **WebSocket connections** from the Rad-Server on port `8080`. Use the following command to start the Mid-Server:  
 ```bash  
 ./mid-server  
 ```  
+Once running, the Mid-Server will wait for the Rad-Server to connect.
 
-Once the Mid-Server is running, configure your browser or tools to use the Mid-Server as a **SOCKS5 proxy**. Set the proxy host to the address of the Mid-Server and port `1080`. For example, in your browser’s network settings, configure the proxy to:  
+**Step 2: Run the Rad-Server**  
+Next, run the **Rad-Server** in the private or remote environment where your backend systems, APIs, or internal tools are hosted. The Rad-Server will establish a secure **outgoing WebSocket connection** to the Mid-Server. Run the Rad-Server with the following command:  
+```bash  
+./rad-server -mid ws://<mid-server-address>:8080/connect  
+```  
+Replace `<mid-server-address>` with the publicly accessible address of the Mid-Server.
+
+**Step 3: Configure Your Browser or Tools**  
+To use the Mid-Server, configure your browser or tools (like Postman or curl) to connect via the **SOCKS5 proxy** exposed by the Mid-Server. Set the proxy settings as follows:  
 - **SOCKS Host**: `<mid-server-address>`  
 - **Port**: `1080`  
 
-At this point, all your browser or tool requests will flow through the Mid-Server. The Mid-Server will securely relay those requests to the Rad-Server over the WebSocket connection, allowing you to access APIs, test servers, or internal applications in the private environment directly and seamlessly.
+For example, you can test access using the following `curl` command:  
+```bash  
+curl --socks5-hostname <mid-server-address>:1080 http://your-internal-api  
+```  
+
+At this point, all requests from your browser or tools will flow through the Mid-Server, which securely relays them to the Rad-Server via the WebSocket connection. The Rad-Server will process the requests and forward responses back through the same connection, enabling seamless access to private systems without exposing any ports.
